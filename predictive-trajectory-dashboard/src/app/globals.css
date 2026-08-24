@@ -1,0 +1,255 @@
+@import "tailwindcss";
+
+:root {
+  --background: #070b12;
+  --foreground: #d7e3ef;
+  --panel: #0c131c;
+  --panel-edge: #1c2a3a;
+  --cyan: #22d3ee;
+  --amber: #f5b942;
+  --ok: #34d399;
+  --military-green: #4a6741;
+  --danger: #f43f5e;
+  --fire-orange: #f97316;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* ---- Telemetry Grid Background ---- */
+.telemetry-grid {
+  background-color: #070b12;
+  background-image:
+    linear-gradient(rgba(34, 211, 238, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* ---- Scanline Overlay ---- */
+.scanline {
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.08) 3px
+  );
+}
+
+/* ---- Scrollbar Styling ---- */
+.log-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.log-scroll::-webkit-scrollbar-thumb {
+  background: #1f3348;
+  border-radius: 999px;
+}
+
+.log-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- LED Pulse Animation ---- */
+@keyframes pulse-led {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55);
+  }
+  50% {
+    opacity: 0.85;
+    box-shadow: 0 0 10px 4px rgba(52, 211, 153, 0.25);
+  }
+}
+
+.led-ok {
+  animation: pulse-led 1.8s ease-in-out infinite;
+}
+
+/* ---- Intercept Flash ---- */
+@keyframes intercept-flash {
+  0% {
+    opacity: 0.15;
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.25;
+  }
+}
+
+.intercept-hit {
+  animation: intercept-flash 0.7s ease-out;
+}
+
+/* ---- Radar Sweep Animation ---- */
+@keyframes radar-sweep {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.radar-sweep {
+  animation: radar-sweep 4s linear infinite;
+}
+
+/* ---- Servo Active Pulse ---- */
+@keyframes servo-pulse {
+  0%, 100% {
+    border-color: rgba(34, 211, 238, 0.3);
+  }
+  50% {
+    border-color: rgba(34, 211, 238, 0.8);
+    box-shadow: 0 0 12px rgba(34, 211, 238, 0.2);
+  }
+}
+
+.servo-active {
+  animation: servo-pulse 1.2s ease-in-out infinite;
+}
+
+/* ---- Barrel Recoil Animation ---- */
+@keyframes recoil {
+  0% {
+    transform: translateZ(0);
+  }
+  15% {
+    transform: translateZ(-8px);
+  }
+  100% {
+    transform: translateZ(0);
+  }
+}
+
+.recoil-flash {
+  animation: recoil 0.6s ease-out;
+}
+
+/* ---- Fire Button Pulse ---- */
+@keyframes fire-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 20px 8px rgba(249, 115, 22, 0.15);
+  }
+}
+
+.fire-ready {
+  animation: fire-pulse 1.5s ease-in-out infinite;
+}
+
+/* ---- Impact Shockwave ---- */
+@keyframes shockwave {
+  0% {
+    r: 0;
+    opacity: 1;
+    stroke-width: 3;
+  }
+  100% {
+    r: 60;
+    opacity: 0;
+    stroke-width: 0.5;
+  }
+}
+
+/* ---- Engagement Mode Badge Colors ---- */
+.mode-standby {
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.4);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.mode-tracking {
+  color: #22d3ee;
+  border-color: rgba(34, 211, 238, 0.4);
+  background: rgba(34, 211, 238, 0.08);
+}
+
+.mode-solution-ready {
+  color: #f5b942;
+  border-color: rgba(245, 185, 66, 0.4);
+  background: rgba(245, 185, 66, 0.08);
+}
+
+.mode-fire {
+  color: #f97316;
+  border-color: rgba(249, 115, 22, 0.5);
+  background: rgba(249, 115, 22, 0.12);
+}
+
+.mode-impact {
+  color: #f43f5e;
+  border-color: rgba(244, 63, 94, 0.5);
+  background: rgba(244, 63, 94, 0.12);
+}
+
+/* ---- Panel Glow Border ---- */
+.panel-glow {
+  position: relative;
+}
+
+.panel-glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 30px rgba(34, 211, 238, 0.03);
+}
+
+/* ---- Tactical Map Target Pulse ---- */
+@keyframes target-pulse {
+  0%, 100% {
+    r: 5;
+    opacity: 1;
+  }
+  50% {
+    r: 10;
+    opacity: 0.5;
+  }
+}
+
+/* ---- Predicted Position Blink ---- */
+@keyframes predicted-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.predicted-marker {
+  animation: predicted-blink 0.8s ease-in-out infinite;
+}
+
+/* ---- Three.js Canvas Container ---- */
+.turret-viewport canvas {
+  border-radius: 0.375rem;
+}

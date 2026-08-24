@@ -1,0 +1,62 @@
+# =============================================================================
+# Root .gitignore — K9 Vajra SPH Fire Control System (FCS)
+# =============================================================================
+
+# --- Node.js & Next.js (predictive-trajectory-dashboard) ---
+node_modules/
+predictive-trajectory-dashboard/node_modules/
+.next/
+predictive-trajectory-dashboard/.next/
+out/
+predictive-trajectory-dashboard/out/
+build/
+predictive-trajectory-dashboard/build/
+*.tsbuildinfo
+predictive-trajectory-dashboard/tsconfig.tsbuildinfo
+next-env.d.ts.bak
+
+# --- Next.js Local Environment Files ---
+.env*.local
+predictive-trajectory-dashboard/.env*.local
+.env
+predictive-trajectory-dashboard/.env
+
+# --- Python & FastAPI (FastAPI/) ---
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+FastAPI/venv/
+FastAPI/.venv/
+.pytest_cache/
+
+# --- FastAPI Media Ingest & Temporary Outputs ---
+FastAPI/uploads/*
+!FastAPI/uploads/.gitkeep
+FastAPI/static/*
+!FastAPI/static/.gitkeep
+
+# --- IDE & System Files ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+build_presentation_pdf.py
+
+gemini.txt
+
+Project_Approach_Abstract_AI_Kavach.pdf
+
+PROJECT_SUMMARY_PROMPT.md
