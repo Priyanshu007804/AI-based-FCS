@@ -56,7 +56,7 @@ export function VideoIngest({
                   : "text-slate-400 hover:text-slate-200"
               }`}
             >
-              YOLO Tracked
+              FCS Target Lock (GMC)
             </button>
             <button
               type="button"
@@ -81,10 +81,10 @@ export function VideoIngest({
           <div className="flex flex-1 flex-col items-center justify-center rounded-md border border-[#1c2a3a] bg-[#05080d] p-6 text-center">
             <Loader2 className="mb-3 h-8 w-8 animate-spin text-cyan-400" />
             <p className="font-mono text-sm font-medium text-cyan-200">
-              YOLOv8 Hunter-Killer Pipeline Processing...
+              GMC + CTRV Hunter-Killer Pipeline Processing...
             </p>
             <p className="mt-1 font-mono text-xs text-slate-500">
-              Detecting armored targets & computing predictive trajectories
+              Compensating drone ego-motion, locking vehicle pixels & computing CTRV lead vectors
             </p>
           </div>
         ) : activeVideoUrl ? (

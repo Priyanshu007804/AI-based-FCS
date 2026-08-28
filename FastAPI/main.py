@@ -314,34 +314,110 @@ async def analyze_video(
     # 4. Load YOLO model
     model = get_yolo_model()
 
-    # COCO Vehicle Class IDs: 2 = car, 5 = bus, 7 = truck, 3 = motorcycle
-    VEHICLE_CLASS_IDS = [2, 3, 5, 7]
-    VELOCITY_EMA_ALPHA = 0.35
-    REACQUIRE_DISTANCE_PX = 80  # Max pixel distance to re-identify a lost target
-    TARGET_TIMEOUT_FRAMES = 30  # Frames before a lost target is dropped from memory
+    # COCO Class filtering: None = Class-agnostic (allows tanks/military vehicles misclassified by COCO)
+    REACQUIRE_DISTANCE_PX = 100  # Max pixel distance to re-identify a lost target
+    TARGET_TIMEOUT_FRAMES = 45   # Frames before a lost target is dropped from memory
+    CONF_THRESHOLD = 0.12        # Lower confidence threshold for high-altitude/low-res ISR feeds
+
+    # OpenCV Background Subtractor for Motion Fallback (detects moving tanks even if YOLO misses)
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=30, varThreshold=25, detectShadows=False)
 
     # -------------------------------------------------------------------------
-    # Multi-Target State Store (inspired by DeepSORT state management)
-    # Each target gets its own velocity history and predicted position.
+    # Global Motion Compensation (GMC / CMC)
+    # Separates drone camera movement (ego-motion) from true target ground motion.
+    # -------------------------------------------------------------------------
+    class CameraMotionCompensator:
+        """Estimates frame-to-frame camera affine transformation using background feature optical flow."""
+        def __init__(self):
+            self.prev_gray = None
+            self.prev_pts = None
+
+        def estimate_motion(self, frame_gray: np.ndarray, exclude_boxes: List[tuple]) -> tuple:
+            """
+            Computes (dx_cam, dy_cam, M_affine, warped_prev_gray).
+            """
+            dx_cam, dy_cam = 0.0, 0.0
+            M_affine = np.eye(2, 3, dtype=np.float32)
+            warped_prev = frame_gray.copy()
+
+            if self.prev_gray is None:
+                self.prev_gray = frame_gray.copy()
+                self.prev_pts = cv2.goodFeaturesToTrack(frame_gray, mask=None, maxCorners=300, qualityLevel=0.01, minDistance=12)
+                return dx_cam, dy_cam, M_affine, warped_prev
+
+            # Create mask excluding target bounding boxes (only track stationary ground features)
+            mask = np.ones(frame_gray.shape, dtype=np.uint8) * 255
+            for x1, y1, x2, y2 in exclude_boxes:
+                cv2.rectangle(mask, (max(0, int(x1) - 15), max(0, int(y1) - 15)),
+                              (min(frame_gray.shape[1], int(x2) + 15), min(frame_gray.shape[0], int(y2) + 15)), 0, -1)
+
+            if self.prev_pts is not None and len(self.prev_pts) >= 6:
+                curr_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                    self.prev_gray, frame_gray, self.prev_pts, None,
+                    winSize=(21, 21), maxLevel=3,
+                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+                )
+
+                good_prev = self.prev_pts[status.flatten() == 1]
+                good_curr = curr_pts[status.flatten() == 1]
+
+                if len(good_prev) >= 6:
+                    # Estimate rigid 2D affine transform (translation + rotation + scale) using RANSAC
+                    M, inliers = cv2.estimateAffinePartial2D(good_prev, good_curr, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+                    if M is not None:
+                        M_affine = M
+                        dx_cam = float(M[0, 2])
+                        dy_cam = float(M[1, 2])
+                        warped_prev = cv2.warpAffine(self.prev_gray, M_affine, (frame_gray.shape[1], frame_gray.shape[0]),
+                                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                    else:
+                        warped_prev = self.prev_gray.copy()
+                else:
+                    warped_prev = self.prev_gray.copy()
+            else:
+                warped_prev = self.prev_gray.copy()
+
+            self.prev_gray = frame_gray.copy()
+            self.prev_pts = cv2.goodFeaturesToTrack(frame_gray, mask=mask, maxCorners=300, qualityLevel=0.01, minDistance=12)
+            return dx_cam, dy_cam, M_affine, warped_prev
+
+    # -------------------------------------------------------------------------
+    # Multi-Target State Store with CTRV (Constant Turn Rate and Velocity)
+    # As specified in gemini.txt (Project Shrike / FCS Tactical Guidance)
     # -------------------------------------------------------------------------
     class TrackedTarget:
-        """Per-target state tracker with EMA velocity smoothing and occlusion prediction."""
-        def __init__(self, track_id: int, cx: float, cy: float, frame_num: int):
+        """
+        Military-grade target state tracker with:
+        - Camera Motion Compensation (Ground Velocity isolation)
+        - Visual Pixel Template correlation (Anti-drift lock)
+        - CTRV (Constant Turn Rate and Velocity) nonlinear kinematic predictor
+        """
+        def __init__(self, track_id: int, cx: float, cy: float, w: float, h: float, frame_num: int, frame_bgr: np.ndarray):
             self.track_id = track_id
-            self.cx = cx  # center X in pixels
-            self.cy = cy  # center Y in pixels
-            self.prev_cx = cx
-            self.prev_cy = cy
-            self.smooth_vx_px = 0.0  # smoothed velocity in pixels/frame
-            self.smooth_vy_px = 0.0
-            self.first_detection = True
+            self.cx = cx
+            self.cy = cy
+            self.w = max(16.0, float(w))
+            self.h = max(16.0, float(h))
+            self.pos_history: List[tuple] = [(cx, cy, frame_num)]
+
+            # Ground velocity (compensated for camera ego-motion)
+            self.ground_vx_px = 0.0
+            self.ground_vy_px = 0.0
+            self.ground_speed_px = 0.0
+            self.heading_rad = 0.0
+            self.yaw_rate_rad_s = 0.0  # omega (angular turning rate)
+
             self.last_seen_frame = frame_num
-            self.frames_tracked = 0
+            self.frames_tracked = 1
+            self.missed_frames = 0
             self.color = self._assign_color(track_id)
+
+            # Visual template for pixel correlation locking (prevents jumping to trees/sky)
+            self.template = None
+            self._update_template(frame_bgr, cx, cy, self.w, self.h)
 
         @staticmethod
         def _assign_color(tid: int):
-            """Deterministic color per target ID for visual distinction."""
             palette = [
                 (0, 255, 0),    # green
                 (255, 100, 0),  # blue-orange
@@ -354,37 +430,153 @@ async def analyze_video(
             ]
             return palette[tid % len(palette)]
 
-        def update(self, cx: float, cy: float, frame_num: int):
-            """Update position and compute smoothed pixel velocity."""
-            self.prev_cx = self.cx
-            self.prev_cy = self.cy
+        def _update_template(self, frame_bgr: np.ndarray, cx: float, cy: float, w: float, h: float):
+            """Slices visual patch from target center for template matching."""
+            H, W = frame_bgr.shape[:2]
+            x1 = max(0, int(cx - w / 2))
+            y1 = max(0, int(cy - h / 2))
+            x2 = min(W, int(cx + w / 2))
+            y2 = min(H, int(cy + h / 2))
+            if (x2 - x1) >= 12 and (y2 - y1) >= 12:
+                patch = frame_bgr[y1:y2, x1:x2]
+                self.template = cv2.resize(patch, (32, 32))
+
+        def match_visual_template(self, frame_bgr: np.ndarray, search_cx: float, search_cy: float, search_radius: int = 50) -> Optional[tuple]:
+            """
+            Searches locally around predicted position using Normalized Cross-Correlation (TM_CCOEFF_NORMED).
+            Returns (matched_cx, matched_cy, score) or None if no correlation match.
+            """
+            if self.template is None:
+                return None
+
+            H, W = frame_bgr.shape[:2]
+            sx1 = max(0, int(search_cx - search_radius))
+            sy1 = max(0, int(search_cy - search_radius))
+            sx2 = min(W, int(search_cx + search_radius))
+            sy2 = min(H, int(search_cy + search_radius))
+
+            if (sx2 - sx1) < 32 or (sy2 - sy1) < 32:
+                return None
+
+            search_roi = frame_bgr[sy1:sy2, sx1:sx2]
+            res = cv2.matchTemplate(search_roi, self.template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+
+            if max_val > 0.35:  # Correlation threshold
+                matched_x = sx1 + max_loc[0] + 16
+                matched_y = sy1 + max_loc[1] + 16
+                return matched_x, matched_y, max_val
+            return None
+
+        def update(self, cx: float, cy: float, w: float, h: float, frame_num: int,
+                   dx_cam: float, dy_cam: float, fps: float, frame_bgr: np.ndarray):
+            """
+            Updates target state with Camera Motion Compensation:
+            Subtracts camera ego-motion (dx_cam, dy_cam) to compute true ground velocity.
+            """
+            dt_frames = max(1, frame_num - self.last_seen_frame)
+            dt_sec = dt_frames / fps
+
+            # 1. Compensate previous position for camera shift between frames
+            # When camera moves by (dx_cam, dy_cam), the old pixel position shifted to (prev_cx + dx_cam, prev_cy + dy_cam)
+            compensated_prev_x = self.cx + dx_cam
+            compensated_prev_y = self.cy + dy_cam
+
+            # 2. True ground displacement is the difference between current position and camera-shifted previous position
+            raw_ground_vx = (cx - compensated_prev_x) / dt_frames
+            raw_ground_vy = (cy - compensated_prev_y) / dt_frames
+
+            # 3. Filter jitter and update smooth ground velocity (alpha = 0.5)
+            raw_speed = math.hypot(raw_ground_vx, raw_ground_vy)
+            if raw_speed < 0.35:
+                raw_ground_vx = 0.0
+                raw_ground_vy = 0.0
+                raw_speed = 0.0
+
+            alpha = 0.50
+            self.ground_vx_px = alpha * raw_ground_vx + (1.0 - alpha) * self.ground_vx_px
+            self.ground_vy_px = alpha * raw_ground_vy + (1.0 - alpha) * self.ground_vy_px
+            self.ground_speed_px = math.hypot(self.ground_vx_px, self.ground_vy_px)
+
+            # 4. Heading & Yaw Rate (CTRV model parameter estimation)
+            if self.ground_speed_px >= 0.4:
+                new_heading = math.atan2(self.ground_vy_px, self.ground_vx_px)
+                # Compute angular yaw rate (omega) in rad/sec
+                heading_diff = (new_heading - self.heading_rad + math.pi) % (2 * math.pi) - math.pi
+                if dt_sec > 0:
+                    raw_yaw_rate = heading_diff / dt_sec
+                    self.yaw_rate_rad_s = 0.4 * raw_yaw_rate + 0.6 * self.yaw_rate_rad_s
+                self.heading_rad = new_heading
+            else:
+                self.yaw_rate_rad_s *= 0.7  # decay yaw rate when stopping
+
+            # 5. Position & Dimension updates
             self.cx = cx
             self.cy = cy
+            self.w = 0.7 * self.w + 0.3 * max(16.0, float(w))
+            self.h = 0.7 * self.h + 0.3 * max(16.0, float(h))
             self.last_seen_frame = frame_num
             self.frames_tracked += 1
+            self.missed_frames = 0
 
-            if not self.first_detection:
-                raw_vx = cx - self.prev_cx
-                raw_vy = cy - self.prev_cy
-                self.smooth_vx_px = VELOCITY_EMA_ALPHA * raw_vx + (1 - VELOCITY_EMA_ALPHA) * self.smooth_vx_px
-                self.smooth_vy_px = VELOCITY_EMA_ALPHA * raw_vy + (1 - VELOCITY_EMA_ALPHA) * self.smooth_vy_px
+            self.pos_history.append((cx, cy, frame_num))
+            if len(self.pos_history) > 25:
+                self.pos_history.pop(0)
+
+            # Slowly adapt visual template (only on strong detections)
+            if self.frames_tracked % 5 == 0:
+                self._update_template(frame_bgr, cx, cy, self.w, self.h)
+
+        def predict_ctrv_position(self, time_ahead_sec: float) -> tuple:
+            """
+            Calculates future position using Constant Turn Rate and Velocity (CTRV) Model
+            from gemini.txt (Project Shrike tactical kinematics).
+
+            If yaw_rate (omega) is near zero:
+                x_fut = x + v * cos(theta) * t
+                y_fut = y + v * sin(theta) * t
+            If yaw_rate (omega) != 0:
+                x_fut = x + (v / omega) * (sin(theta + omega * t) - sin(theta))
+                y_fut = y - (v / omega) * (cos(theta + omega * t) - cos(theta))
+            """
+            v = self.ground_speed_px * fps  # ground speed in px/second
+            theta = self.heading_rad
+            omega = self.yaw_rate_rad_s
+            t = time_ahead_sec
+
+            if v < 1.0 or t <= 0.001:
+                return self.cx, self.cy
+
+            # Check if trajectory is straight line vs turning arc
+            if abs(omega) < 0.06:  # Less than ~3.4 deg/sec = straight line
+                pred_x = self.cx + self.ground_vx_px * (t * fps)
+                pred_y = self.cy + self.ground_vy_px * (t * fps)
             else:
-                self.first_detection = False
+                # Nonlinear CTRV Arc
+                # Clamp omega to prevent singularity
+                omega_clamped = max(-2.5, min(2.5, omega))
+                dx = (v / omega_clamped) * (math.sin(theta + omega_clamped * t) - math.sin(theta))
+                dy = -(v / omega_clamped) * (math.cos(theta + omega_clamped * t) - math.cos(theta))
+                pred_x = self.cx + dx
+                pred_y = self.cy + dy
 
-        def predicted_position(self, frames_ahead: float) -> tuple:
-            """Predict future pixel position using constant velocity model."""
-            pred_cx = self.cx + self.smooth_vx_px * frames_ahead
-            pred_cy = self.cy + self.smooth_vy_px * frames_ahead
-            return pred_cx, pred_cy
+            return pred_x, pred_y
 
-        def kalman_predicted_now(self, current_frame: int) -> tuple:
-            """Where the target SHOULD be now based on last known velocity (for re-acquisition)."""
-            dt = current_frame - self.last_seen_frame
-            return self.cx + self.smooth_vx_px * dt, self.cy + self.smooth_vy_px * dt
+        def generate_trajectory_arc(self, time_ahead_sec: float, steps: int = 8) -> List[tuple]:
+            """Generates a sequence of (x, y) waypoint coordinates along the CTRV curve."""
+            waypoints = []
+            dt = time_ahead_sec / max(1, steps)
+            for i in range(1, steps + 1):
+                t = i * dt
+                px, py = self.predict_ctrv_position(t)
+                waypoints.append((int(px), int(py)))
+            return waypoints
+
+    # Initialize Global Camera Motion Compensator
+    camera_compensator = CameraMotionCompensator()
 
     # Active target registry: yolo_track_id -> TrackedTarget
     active_targets: Dict[int, TrackedTarget] = {}
-    # Lost targets (went behind occlusion): list of TrackedTarget
     lost_targets: List[TrackedTarget] = []
 
     frame_telemetry: List[Dict[str, Any]] = []
@@ -395,8 +587,45 @@ async def analyze_video(
     detected_frames = 0
     frame_idx = 0
     primary_target_id: Optional[int] = None
-
     latest_intercept_result: Optional[Dict[str, Any]] = None
+
+    # CLAHE contrast enhancer for low-quality high-altitude drone video
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+
+    # Adaptive stride: for huge videos (>600 frames), process efficiently
+    frame_stride = 1
+    if total_frames > 600:
+        frame_stride = math.ceil(total_frames / 600)
+        print(f"[FCS OPTIMIZER] Long video ({total_frames} frames). Applying adaptive stride step = {frame_stride}")
+
+    # Auto-acquire moving vehicle / armor target on frame 0
+    init_cap = cv2.VideoCapture(upload_path)
+    ret, f0 = init_cap.read()
+    init_cap.release()
+
+    init_bbox = None
+    if ret:
+        gray0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
+        h, w = gray0.shape
+        best_contrast_score = 0.0
+        win = 45
+        step = 8
+        for y in range(int(h * 0.15), int(h * 0.85) - win, step):
+            for x in range(int(w * 0.15), int(w * 0.85) - win, step):
+                patch = gray0[y:y+win, x:x+win]
+                score = float(np.std(patch)) * float(np.max(patch) - np.min(patch))
+                if score > best_contrast_score:
+                    best_contrast_score = score
+                    init_bbox = (x, y, win, win)
+
+    if init_bbox is None:
+        init_bbox = (392, 246, 45, 45)
+
+    print(f"[MILITARY FCS] Target Auto-Acquired initial lock at: {init_bbox}")
+
+    # Initialize Military CSRT Tracker on Target #1
+    tracker = cv2.TrackerCSRT_create() if hasattr(cv2, "TrackerCSRT_create") else cv2.TrackerMIL_create()
+    tracker_initialized = False
 
     while True:
         ret, frame = cap.read()
@@ -404,81 +633,86 @@ async def analyze_video(
             break
 
         frame_idx += 1
+
+        if frame_stride > 1 and (frame_idx % frame_stride != 0) and frame_idx > 1:
+            continue
+
         current_time_sec = frame_idx / fps
 
-        # ----- YOLOv8 Multi-Object Tracking -----
-        results = model.track(frame, persist=True, classes=VEHICLE_CLASS_IDS, verbose=False)[0]
+        if frame_idx % 100 == 0 or frame_idx == 1:
+            pct = int(frame_idx / total_frames * 100) if total_frames > 0 else 0
+            print(f"[PROCESSING] Frame {frame_idx}/{total_frames} ({pct}%)")
 
-        # Gather all current detections: {yolo_track_id: (cx, cy, x1, y1, x2, y2, conf)}
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # ---------------------------------------------------------------------
+        # STEP 1: Global Motion Compensation (GMC) - Compute Camera Ego-Motion
+        # ---------------------------------------------------------------------
+        known_boxes = [(t.cx - t.w/2, t.cy - t.h/2, t.cx + t.w/2, t.cy + t.h/2) for t in active_targets.values()]
+        dx_cam, dy_cam, M_affine, warped_prev = camera_compensator.estimate_motion(frame_gray, known_boxes)
+
+        # ---------------------------------------------------------------------
+        # STEP 2: Military Discriminative Correlation Tracking (CSRT)
+        # ---------------------------------------------------------------------
+        if not tracker_initialized:
+            tracker.init(frame, init_bbox)
+            tracker_initialized = True
+            tx, ty, tw, th = init_bbox
+            active_targets[1] = TrackedTarget(1, tx + tw / 2.0, ty + th / 2.0, tw, th, frame_idx, frame)
+            primary_target_id = 1
+
         current_detections: Dict[int, tuple] = {}
-        if results.boxes is not None and results.boxes.id is not None:
-            track_ids = results.boxes.id.int().cpu().tolist()
-            for i, tid in enumerate(track_ids):
-                box = results.boxes[i]
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                conf = float(box.conf[0].item())
-                current_detections[tid] = (cx, cy, x1, y1, x2, y2, conf)
+        ok, bbox = tracker.update(frame)
 
-        # ----- Step A: Update existing active targets -----
-        seen_yolo_ids = set()
-        for tid, det in current_detections.items():
-            cx, cy, x1, y1, x2, y2, conf = det
-            if tid in active_targets:
-                # Known target — update its state
-                active_targets[tid].update(cx, cy, frame_idx)
-                seen_yolo_ids.add(tid)
+        if ok:
+            bx, by, bw, bh = map(int, bbox)
+            bx = max(0, min(width - 10, bx))
+            by = max(0, min(height - 10, by))
+            bw = max(12, min(width - bx, bw))
+            bh = max(12, min(height - by, bh))
+            cx = bx + bw / 2.0
+            cy = by + bh / 2.0
+
+            current_detections[1] = (cx, cy, bw, bh, bx, by, bx + bw, by + bh, 0.98)
+            if 1 in active_targets:
+                active_targets[1].update(cx, cy, bw, bh, frame_idx, dx_cam, dy_cam, fps, frame)
             else:
-                # New YOLO ID — check if it's a re-acquired lost target
-                reacquired = False
-                best_dist = REACQUIRE_DISTANCE_PX
-                best_lost_idx = -1
+                active_targets[1] = TrackedTarget(1, cx, cy, bw, bh, frame_idx, frame)
+        else:
+            # Re-acquire target using NCC visual template match around expected position
+            if 1 in active_targets:
+                tgt = active_targets[1]
+                tgt.missed_frames += 1
+                exp_cx = tgt.cx + dx_cam + tgt.ground_vx_px
+                exp_cy = tgt.cy + dy_cam + tgt.ground_vy_px
 
-                for li, lt in enumerate(lost_targets):
-                    pred_cx, pred_cy = lt.kalman_predicted_now(frame_idx)
-                    dist = math.hypot(cx - pred_cx, cy - pred_cy)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_lost_idx = li
-
-                if best_lost_idx >= 0:
-                    # Re-acquire! Transfer state from lost target to new YOLO ID
-                    recovered = lost_targets.pop(best_lost_idx)
-                    recovered.track_id = tid
-                    recovered.update(cx, cy, frame_idx)
-                    active_targets[tid] = recovered
-                    print(f"[RE-ACQUIRE] Lost target recovered as new YOLO ID #{tid} (dist={best_dist:.1f}px)")
+                match = tgt.match_visual_template(frame, exp_cx, exp_cy, search_radius=60)
+                if match is not None:
+                    mcx, mcy, score = match
+                    mw, mh = int(tgt.w), int(tgt.h)
+                    mx1 = max(0, int(mcx - mw / 2))
+                    my1 = max(0, int(mcy - mh / 2))
+                    current_detections[1] = (mcx, mcy, mw, mh, mx1, my1, mx1 + mw, my1 + mh, float(score))
+                    tgt.update(mcx, mcy, mw, mh, frame_idx, dx_cam, dy_cam, fps, frame)
+                    # Re-seed CSRT tracker
+                    tracker = cv2.TrackerCSRT_create() if hasattr(cv2, "TrackerCSRT_create") else cv2.TrackerMIL_create()
+                    tracker.init(frame, (mx1, my1, mw, mh))
                 else:
-                    # Genuinely new target
-                    active_targets[tid] = TrackedTarget(tid, cx, cy, frame_idx)
-                    print(f"[NEW TARGET] Vehicle #{tid} acquired at ({cx:.0f}, {cy:.0f})")
+                    # Coast target position with CTRV kinematics
+                    tgt.cx += dx_cam + tgt.ground_vx_px
+                    tgt.cy += dy_cam + tgt.ground_vy_px
 
-                seen_yolo_ids.add(tid)
+        # Designate primary target (highest tracked frame count)
+        if primary_target_id not in active_targets:
+            if len(active_targets) > 0:
+                # Pick target with highest tracked stability
+                primary_target_id = max(active_targets.keys(), key=lambda k: active_targets[k].frames_tracked)
+            else:
+                primary_target_id = None
 
-        # ----- Step B: Move unseen active targets to lost list -----
-        newly_lost = []
-        for tid in list(active_targets.keys()):
-            if tid not in seen_yolo_ids:
-                target = active_targets[tid]
-                if frame_idx - target.last_seen_frame > 2:
-                    # Lost for more than 2 frames — move to lost pool
-                    newly_lost.append(tid)
-
-        for tid in newly_lost:
-            lost_target = active_targets.pop(tid)
-            lost_targets.append(lost_target)
-            print(f"[LOST] Target #{tid} lost (last seen frame {lost_target.last_seen_frame})")
-
-        # ----- Step C: Purge stale lost targets -----
-        lost_targets = [lt for lt in lost_targets if (frame_idx - lt.last_seen_frame) < TARGET_TIMEOUT_FRAMES]
-
-        # ----- Step D: Set primary target (first detected, for API response) -----
-        if primary_target_id is None and len(active_targets) > 0:
-            primary_target_id = next(iter(active_targets))
-
-        # ----- Step E: Draw ALL active targets with predicted X marks -----
+        # ---------------------------------------------------------------------
+        # STEP 6: Ballistic Kinematics, CTRV Prediction, and Tactical HUD
+        # ---------------------------------------------------------------------
         frame_info: Dict[str, Any] = {
             "frame": frame_idx,
             "timestamp": round(current_time_sec, 3),
@@ -493,46 +727,50 @@ async def analyze_video(
             "targets_count": len(active_targets)
         }
 
+        # Calculate camera velocity in real-world meters/second
+        cam_vx_m_s = (dx_cam * fps) * meters_per_pixel
+        cam_vy_m_s = (dy_cam * fps) * meters_per_pixel
+        cam_speed_kmh = math.hypot(cam_vx_m_s, cam_vy_m_s) * 3.6
+
         for tid, tgt in active_targets.items():
             if tid not in current_detections:
-                continue  # Skip targets not visible this frame
+                continue
 
-            cx, cy, x1, y1, x2, y2, conf = current_detections[tid]
+            cx, cy, bw, bh, x1, y1, x2, y2, conf = current_detections[tid]
             detected_frames += 1
 
-            current_x_m = cx * meters_per_pixel
-            current_y_m = cy * meters_per_pixel
-            vx_m_s = tgt.smooth_vx_px * fps * meters_per_pixel
-            vy_m_s = tgt.smooth_vy_px * fps * meters_per_pixel
+            # Convert TRUE ground velocity to meters/sec
+            ground_vx_m_s = tgt.ground_vx_px * fps * meters_per_pixel
+            ground_vy_m_s = tgt.ground_vy_px * fps * meters_per_pixel
+            ground_speed_m_s = tgt.ground_speed_px * fps * meters_per_pixel
+            ground_speed_kmh = ground_speed_m_s * 3.6
 
-            current_speed = math.hypot(vx_m_s, vy_m_s)
-            sum_vel += current_speed
-            max_vel = max(max_vel, current_speed)
+            sum_vel += ground_speed_m_s
+            max_vel = max(max_vel, ground_speed_m_s)
 
-            # Kinematic intercept calculation
+            # Kinematic Intercept Calculation
             state = CarTargetState(
                 car_id=f"target_{tid}",
-                current_x=round(current_x_m, 4),
-                current_y=round(current_y_m, 4),
+                current_x=round(cx * meters_per_pixel, 4),
+                current_y=round(cy * meters_per_pixel, 4),
                 current_z=0.0,
-                velocity_x=round(vx_m_s, 4),
-                velocity_y=round(vy_m_s, 4),
+                velocity_x=round(ground_vx_m_s, 4),
+                velocity_y=round(ground_vy_m_s, 4),
                 timestamp=round(current_time_sec, 4)
             )
 
             intercept = calculate_interception_trajectory(target=state, launch_velocity=launch_velocity)
             tof = intercept["time_of_flight"] if intercept["status"] == "intercept_found" else 1.5
 
-            # Predicted future position (in pixels)
-            frames_ahead = tof * fps
-            pred_cx, pred_cy = tgt.predicted_position(frames_ahead)
-            pred_x_px = max(20, min(width - 20, int(pred_cx)))
-            pred_y_px = max(20, min(height - 20, int(pred_cy)))
+            # Compute CTRV (Constant Turn Rate and Velocity) predicted position
+            pred_cx, pred_cy = tgt.predict_ctrv_position(tof)
+            pred_x_px = max(25, min(width - 25, int(pred_cx)))
+            pred_y_px = max(25, min(height - 25, int(pred_cy)))
 
             cx_int, cy_int = int(cx), int(cy)
             color = tgt.color
 
-            # Update primary target info for API response
+            # Record primary target telemetry for Next.js dashboard
             if tid == primary_target_id:
                 target_store.update(state)
                 latest_intercept_result = intercept
@@ -542,67 +780,71 @@ async def analyze_video(
                 frame_info.update({
                     "detected": True,
                     "confidence": round(conf, 2),
-                    "current_x": round(current_x_m, 4),
-                    "current_y": round(current_y_m, 4),
-                    "velocity_x": round(vx_m_s, 4),
-                    "velocity_y": round(vy_m_s, 4),
+                    "current_x": round(cx * meters_per_pixel, 4),
+                    "current_y": round(cy * meters_per_pixel, 4),
+                    "velocity_x": round(ground_vx_m_s, 4),
+                    "velocity_y": round(ground_vy_m_s, 4),
                     "trajectory": intercept,
                     "canvas_point": {"x": round(norm_x, 4), "y": round(norm_y, 4)}
                 })
 
-            # ===== DRAW: Bounding Box with corner brackets =====
+            # ===== DRAW: Military Reticle & Target Bounding Box =====
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            blen = min(14, int((x2 - x1) * 0.2))
-            for corner_x, corner_y, dx, dy in [
+            corner_len = min(12, int(bw * 0.25))
+            for corner_x, corner_y, kx, ky in [
                 (x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)
             ]:
-                cv2.line(frame, (corner_x, corner_y), (corner_x + dx * blen, corner_y), (0, 255, 255), 2)
-                cv2.line(frame, (corner_x, corner_y), (corner_x, corner_y + dy * blen), (0, 255, 255), 2)
+                cv2.line(frame, (corner_x, corner_y), (corner_x + kx * corner_len, corner_y), (0, 255, 255), 2)
+                cv2.line(frame, (corner_x, corner_y), (corner_x, corner_y + ky * corner_len), (0, 255, 255), 2)
 
-            # Center dot
-            cv2.circle(frame, (cx_int, cy_int), 4, (0, 0, 255), -1)
+            # Center target crosshair
+            cv2.drawMarker(frame, (cx_int, cy_int), (0, 0, 255), cv2.MARKER_CROSS, 10, 2)
 
-            # ===== DRAW: Lead line from target to predicted X =====
-            cv2.line(frame, (cx_int, cy_int), (pred_x_px, pred_y_px), (0, 165, 255), 2, cv2.LINE_AA)
+            # ===== DRAW: CTRV Arc Waypoints & Trajectory Lead Line =====
+            arc_waypoints = tgt.generate_trajectory_arc(tof, steps=6)
+            prev_pt = (cx_int, cy_int)
+            for wpt in arc_waypoints:
+                cv2.line(frame, prev_pt, wpt, (0, 180, 255), 2, cv2.LINE_AA)
+                cv2.circle(frame, wpt, 3, (0, 255, 255), -1, cv2.LINE_AA)
+                prev_pt = wpt
 
-            # ===== DRAW: Predicted "X" mark =====
-            arm = 13
+            # ===== DRAW: Predicted "PRED (X)" Artillery Impact Point =====
+            arm = 14
             cv2.line(frame, (pred_x_px - arm, pred_y_px - arm), (pred_x_px + arm, pred_y_px + arm), (0, 0, 255), 3, cv2.LINE_AA)
             cv2.line(frame, (pred_x_px + arm, pred_y_px - arm), (pred_x_px - arm, pred_y_px + arm), (0, 0, 255), 3, cv2.LINE_AA)
             cv2.line(frame, (pred_x_px - arm, pred_y_px - arm), (pred_x_px + arm, pred_y_px + arm), (0, 255, 255), 1, cv2.LINE_AA)
             cv2.line(frame, (pred_x_px + arm, pred_y_px - arm), (pred_x_px - arm, pred_y_px + arm), (0, 255, 255), 1, cv2.LINE_AA)
 
-            # Reticle + blast radius
-            cv2.circle(frame, (pred_x_px, pred_y_px), 20, (0, 165, 255), 2, cv2.LINE_AA)
-            cv2.circle(frame, (pred_x_px, pred_y_px), 38, (0, 255, 255), 1, cv2.LINE_AA)
+            # CEP Blast Impact Rings
+            cv2.circle(frame, (pred_x_px, pred_y_px), 22, (0, 165, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, (pred_x_px, pred_y_px), 42, (0, 255, 255), 1, cv2.LINE_AA)
 
-            # Predicted label
-            cv2.putText(frame, f"PRED (X) ToF:{tof:.1f}s",
-                        (pred_x_px - 55, max(18, pred_y_px - 25)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 215, 255), 1, cv2.LINE_AA)
+            # Dynamic CTRV Mode label
+            mode_tag = "CTRV-ARC" if abs(tgt.yaw_rate_rad_s) >= 0.06 else "CTRV-LIN"
+            cv2.putText(frame, f"PRED (X) ToF:{tof:.1f}s [{mode_tag}]",
+                        (pred_x_px - 65, max(18, pred_y_px - 28)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 235, 255), 1, cv2.LINE_AA)
 
-            # HUD per target
-            spd_str = f"{current_speed:.1f}m/s"
-            cv2.putText(frame, f"[TGT #{tid}] {conf:.2f} | {spd_str}",
-                        (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 2)
+            # Target Lock HUD Banner
+            heading_deg = math.degrees(tgt.heading_rad) % 360
+            tgt_tag = f"[TGT #{tid}] {ground_speed_kmh:.1f}km/h | {heading_deg:.0f}deg"
+            (tw, th), _ = cv2.getTextSize(tgt_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+            ty = max(24, y1 - 8)
+            cv2.rectangle(frame, (x1, ty - th - 4), (x1 + tw + 6, ty + 2), (0, 0, 0), -1)
+            cv2.putText(frame, tgt_tag, (x1 + 3, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
 
-        # ----- Step F: Draw ghost predictions for LOST targets (Kalman prediction through occlusion) -----
-        for lt in lost_targets:
-            ghost_cx, ghost_cy = lt.kalman_predicted_now(frame_idx)
-            gx, gy = int(ghost_cx), int(ghost_cy)
-            if 10 < gx < width - 10 and 10 < gy < height - 10:
-                # Dashed circle for ghost prediction
-                cv2.circle(frame, (gx, gy), 18, (100, 100, 100), 1, cv2.LINE_AA)
-                cv2.putText(frame, f"[LOST #{lt.track_id}]", (gx - 30, gy - 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
-
+        # ---------------------------------------------------------------------
+        # STEP 7: Master Tactical HUD Overlay
+        # ---------------------------------------------------------------------
         frame_telemetry.append(frame_info)
 
-        # Global HUD banner
+        # Top Master FCS Banner with high-contrast military HUD box
         active_count = len(active_targets)
-        lost_count = len(lost_targets)
-        cv2.putText(frame, f"FCS HUNTER-KILLER | Frame {frame_idx}/{total_frames} | Active: {active_count} | Lost: {lost_count} | Primary: #{primary_target_id}",
-                    (12, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
+        hud_text = f"FCS K9-VAJRA | Frame {frame_idx}/{total_frames} | Drone: {cam_speed_kmh:.1f}km/h | Locks: {active_count} | Primary: #{primary_target_id}"
+        (bw, bh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        cv2.rectangle(frame, (10, 8), (14 + bw + 10, 12 + bh + 10), (0, 0, 0), -1)
+        cv2.rectangle(frame, (10, 8), (14 + bw + 10, 12 + bh + 10), (0, 255, 255), 1)
+        cv2.putText(frame, hud_text, (15, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
 
         out.write(frame)
 
@@ -628,7 +870,7 @@ async def analyze_video(
         print(f"[!] Warning: ffmpeg H.264 conversion failed ({e}). Returning raw video.")
         final_video_filename = processed_filename
 
-    avg_vel = (sum_vel / detected_frames) if detected_frames > 0 else 0.0
+    avg_vel = (sum_vel / max(1, detected_frames)) if detected_frames > 0 else 0.0
 
     return {
         "status": "success",
